@@ -1,0 +1,34 @@
+$TTL 3600
+
+@	IN	SOA	ns1.domaindiscover.com.	hostmaster.tierra.net. (
+				2026030601	; Serial
+				7200	; Refresh
+				1800	; Retry
+				604800	; Expire
+				28800 )	; Minimum
+
+@	3600	NS		ns1.domaindiscover.com.
+@	3600	NS		ns2.domaindiscover.com.
+miami	3600	CNAME		sites.domainspot.com.
+www.miami	3600	CNAME		sites.domainspot.com.
+miami	3600	MX	10	mx1.daemonmail.net.
+miami	3600	MX	10	mx2.daemonmail.net.
+www	300	A	100.1.72.246
+@	300	A	100.1.72.246
+ha	300	A	100.1.72.246
+_atproto.willyr0	3600	TXT	"did=did:plc:bqurxroyjutruegcqquibtde"
+_atproto.beanpoppa	3600	TXT	"did=did:plc:4ycst3mzjj2q77nnf5xva2pp"
+@	300	MX	5	alt2.aspmx.l.google.com.
+@	300	MX	1	aspmx.l.google.com.
+@	300	MX	10	aspmx2.googlemail.com.
+@	300	MX	10	aspmx3.googlemail.com.
+@	300	MX	5	alt1.aspmx.l.google.com.
+@	3600	TXT	"v=spf1 include:_spf.google.com ~all"
+_dmarc	3600	TXT	"v=DMARC1; p=reject; pct=1; rua=mailto:0tayqma5@ag.dmarcian.com; ruf=mailto:0tayqma5@fr.dmarcian.com;"
+google._domainkey	3600	TXT	"v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAhAupwiuXUA+1/SXwdJmJYxQI7h53HN/lSxA0rjq92arHhH7hcDnBlsW7PRXVDj9LQVY9XqHMWa3GVKq2e4bSQ47hftGRLGeCR3caA6e/YCFQrU0N3TPE/RwsPw/O0VdoOo9efav+P91Ne30pUzzUZvx1XAcgnj7asw90HhJIo32mf49S2wRhZOeUkxarmq/nZemKBfoQGULgdElfn5iNgiQ5W+vVnZf+TcQlvRWNUmw3Fa8sUMsRJfRrFF+tqqewsOAQRM0slhiim+Jl+bQLpwp/VOhnJBCGAkL776cz4bt4bQ4mbJZwIaBXY1WO8yj/KpUjDUCf11r/86CTa8mvpwIDAQAB"
+cloud	300	CNAME		rintzler.dnsalis.com.
+will	300	CNAME		ghs.googlehosted.com.
+sites	300	CNAME		ghs.googlehosted.com.
+calendar	300	CNAME		ghs.googlehosted.com.
+mail	300	CNAME		ghs.googlehosted.com.
+@	3600	TXT	"google-site-verification=bz97yV63Zm5kxan1aosMSVTLU-uDNGvMX6_pPrWWVpU"
