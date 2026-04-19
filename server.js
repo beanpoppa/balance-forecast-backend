@@ -2,13 +2,20 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-in-production";
+
+// B001: Fail fast if JWT_SECRET is not explicitly set
+if (!process.env.JWT_SECRET) {
+  console.error("FATAL: JWT_SECRET environment variable is not set. Refusing to start.");
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 const DB_PATH = process.env.DB_PATH || "/data/forecast.db";
 
 // Ensure data directory exists
@@ -74,6 +81,9 @@ db.exec(`
 app.use(cors());
 app.use(express.json());
 
+// B002: Rate-limit login attempts (10 per 15 min per IP)
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: "Too many login attempts, please try again later." } });
+
 // ── Auth middleware ───────────────────────────────────────────────────────────
 function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.split(" ")[1];
@@ -96,6 +106,7 @@ function adminMiddleware(req, res, next) {
 app.post("/api/setup", (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Username and password required" });
+  if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
   const existing = db.prepare("SELECT id FROM users LIMIT 1").get();
   if (existing) return res.status(400).json({ error: "Setup already complete" });
   const hash = bcrypt.hashSync(password, 10);
@@ -105,7 +116,7 @@ app.post("/api/setup", (req, res) => {
   res.json({ token, username, is_admin: true });
 });
 
-app.post("/api/login", (req, res) => {
+app.post("/api/login", loginLimiter, (req, res) => {
   const { username, password } = req.body;
   const user = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
   if (!user || !bcrypt.compareSync(password, user.password))
@@ -123,6 +134,7 @@ app.get("/api/users", authMiddleware, adminMiddleware, (req, res) => {
 app.post("/api/users", authMiddleware, adminMiddleware, (req, res) => {
   const { username, password, is_admin } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Username and password required" });
+  if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
   try {
     const hash = bcrypt.hashSync(password, 10);
     const result = db.prepare("INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)").run(username, hash, is_admin ? 1 : 0);
@@ -139,6 +151,7 @@ app.delete("/api/users/:id", authMiddleware, adminMiddleware, (req, res) => {
   if (id === req.user.id) return res.status(400).json({ error: "Cannot delete yourself" });
   db.prepare("DELETE FROM reconciled WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM cancelled WHERE user_id = ?").run(id);
+  db.prepare("DELETE FROM overrides WHERE user_id = ?").run(id); // B005
   db.prepare("DELETE FROM items WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM user_data WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM users WHERE id = ?").run(id);
@@ -186,15 +199,19 @@ app.post("/api/items", authMiddleware, (req, res) => {
 });
 
 app.put("/api/items/:id", authMiddleware, (req, res) => {
-  const { amount } = req.body;
-  if (amount === undefined) return res.status(400).json({ error: "amount required" });
-  db.prepare("UPDATE items SET amount = ? WHERE id = ? AND user_id = ?").run(amount, req.params.id, req.user.id);
+  const { name, amount, type, frequency, startDate, endDate } = req.body;
+  if (!name || amount === undefined || !type || !frequency || !startDate)
+    return res.status(400).json({ error: "name, amount, type, frequency, and startDate are required" });
+  db.prepare("UPDATE items SET name=?, amount=?, type=?, frequency=?, start_date=?, end_date=? WHERE id=? AND user_id=?")
+    .run(name, amount, type, frequency, startDate, endDate || "", req.params.id, req.user.id);
   res.json({ ok: true });
 });
 
 app.delete("/api/items/:id", authMiddleware, (req, res) => {
   db.prepare("DELETE FROM items WHERE id = ? AND user_id = ?").run(req.params.id, req.user.id);
   db.prepare("DELETE FROM reconciled WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`);
+  db.prepare("DELETE FROM cancelled WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`); // B004
+  db.prepare("DELETE FROM overrides WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`);  // B004
   res.json({ ok: true });
 });
 
