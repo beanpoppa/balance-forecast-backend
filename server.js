@@ -55,6 +55,15 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
 
+  CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
   CREATE TABLE IF NOT EXISTS reconciled (
     user_id INTEGER NOT NULL,
     key TEXT NOT NULL,
@@ -77,6 +86,30 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
 `);
+
+// ── Idempotent migration: add items.category_id if missing ───────────────────
+const itemColumns = db.prepare("PRAGMA table_info(items)").all();
+if (!itemColumns.some(c => c.name === "category_id")) {
+  db.exec("ALTER TABLE items ADD COLUMN category_id INTEGER REFERENCES categories(id)");
+}
+
+// ── Default categories ─────────────────────────────────────────────────────────
+const DEFAULT_EXPENSE_CATEGORIES = ["Groceries", "Rent", "Utilities", "Entertainment", "Healthcare", "Other"];
+const DEFAULT_INCOME_CATEGORIES = ["Salary", "Freelance", "Gifts", "Other"];
+
+function seedDefaultCategories(userId) {
+  const insert = db.prepare("INSERT INTO categories (user_id, name, type) VALUES (?, ?, ?)");
+  db.transaction((uid) => {
+    DEFAULT_EXPENSE_CATEGORIES.forEach(name => insert.run(uid, name, "expense"));
+    DEFAULT_INCOME_CATEGORIES.forEach(name => insert.run(uid, name, "income"));
+  })(userId);
+}
+
+// One-time backfill: seed categories for any existing user who has none
+const catCountStmt = db.prepare("SELECT COUNT(*) as n FROM categories WHERE user_id = ?");
+db.prepare("SELECT id FROM users").all().forEach(u => {
+  if (catCountStmt.get(u.id).n === 0) seedDefaultCategories(u.id);
+});
 
 app.use(cors());
 app.use(express.json());
@@ -112,6 +145,7 @@ app.post("/api/setup", (req, res) => {
   const hash = bcrypt.hashSync(password, 10);
   const result = db.prepare("INSERT INTO users (username, password, is_admin) VALUES (?, ?, 1)").run(username, hash);
   db.prepare("INSERT INTO user_data (user_id) VALUES (?)").run(result.lastInsertRowid);
+  seedDefaultCategories(result.lastInsertRowid);
   const token = jwt.sign({ id: result.lastInsertRowid, username, is_admin: true }, JWT_SECRET, { expiresIn: "7d" });
   res.json({ token, username, is_admin: true });
 });
@@ -139,6 +173,7 @@ app.post("/api/users", authMiddleware, adminMiddleware, (req, res) => {
     const hash = bcrypt.hashSync(password, 10);
     const result = db.prepare("INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)").run(username, hash, is_admin ? 1 : 0);
     db.prepare("INSERT INTO user_data (user_id) VALUES (?)").run(result.lastInsertRowid);
+    seedDefaultCategories(result.lastInsertRowid);
     res.json({ id: result.lastInsertRowid, username, is_admin: !!is_admin });
   } catch (e) {
     if (e.message.includes("UNIQUE")) return res.status(400).json({ error: "Username already exists" });
@@ -153,6 +188,7 @@ app.delete("/api/users/:id", authMiddleware, adminMiddleware, (req, res) => {
   db.prepare("DELETE FROM cancelled WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM overrides WHERE user_id = ?").run(id); // B005
   db.prepare("DELETE FROM items WHERE user_id = ?").run(id);
+  db.prepare("DELETE FROM categories WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM user_data WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM users WHERE id = ?").run(id);
   res.json({ ok: true });
@@ -188,22 +224,34 @@ app.put("/api/settings", authMiddleware, (req, res) => {
 // ── Items ─────────────────────────────────────────────────────────────────────
 app.get("/api/items", authMiddleware, (req, res) => {
   const items = db.prepare("SELECT * FROM items WHERE user_id = ?").all(req.user.id);
-  res.json(items.map(i => ({ ...i, endDate: i.end_date, startDate: i.start_date })));
+  res.json(items.map(i => ({ ...i, endDate: i.end_date, startDate: i.start_date, categoryId: i.category_id })));
 });
 
+function resolveCategoryId(userId, categoryId, type) {
+  if (!categoryId) return { ok: true, catId: null };
+  const cat = db.prepare("SELECT * FROM categories WHERE id = ? AND user_id = ?").get(categoryId, userId);
+  if (!cat) return { ok: false, error: "Invalid category" };
+  if (cat.type !== type) return { ok: false, error: "Category type does not match item type" };
+  return { ok: true, catId: categoryId };
+}
+
 app.post("/api/items", authMiddleware, (req, res) => {
-  const { name, amount, type, frequency, startDate, endDate } = req.body;
-  const result = db.prepare("INSERT INTO items (user_id, name, amount, type, frequency, start_date, end_date) VALUES (?,?,?,?,?,?,?)")
-    .run(req.user.id, name, amount, type, frequency, startDate, endDate || "");
-  res.json({ id: result.lastInsertRowid, name, amount, type, frequency, startDate, endDate: endDate || "" });
+  const { name, amount, type, frequency, startDate, endDate, categoryId } = req.body;
+  const resolved = resolveCategoryId(req.user.id, categoryId, type);
+  if (!resolved.ok) return res.status(400).json({ error: resolved.error });
+  const result = db.prepare("INSERT INTO items (user_id, name, amount, type, frequency, start_date, end_date, category_id) VALUES (?,?,?,?,?,?,?,?)")
+    .run(req.user.id, name, amount, type, frequency, startDate, endDate || "", resolved.catId);
+  res.json({ id: result.lastInsertRowid, name, amount, type, frequency, startDate, endDate: endDate || "", categoryId: resolved.catId });
 });
 
 app.put("/api/items/:id", authMiddleware, (req, res) => {
-  const { name, amount, type, frequency, startDate, endDate } = req.body;
+  const { name, amount, type, frequency, startDate, endDate, categoryId } = req.body;
   if (!name || amount === undefined || !type || !frequency || !startDate)
     return res.status(400).json({ error: "name, amount, type, frequency, and startDate are required" });
-  db.prepare("UPDATE items SET name=?, amount=?, type=?, frequency=?, start_date=?, end_date=? WHERE id=? AND user_id=?")
-    .run(name, amount, type, frequency, startDate, endDate || "", req.params.id, req.user.id);
+  const resolved = resolveCategoryId(req.user.id, categoryId, type);
+  if (!resolved.ok) return res.status(400).json({ error: resolved.error });
+  db.prepare("UPDATE items SET name=?, amount=?, type=?, frequency=?, start_date=?, end_date=?, category_id=? WHERE id=? AND user_id=?")
+    .run(name, amount, type, frequency, startDate, endDate || "", resolved.catId, req.params.id, req.user.id);
   res.json({ ok: true });
 });
 
@@ -212,6 +260,47 @@ app.delete("/api/items/:id", authMiddleware, (req, res) => {
   db.prepare("DELETE FROM reconciled WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`);
   db.prepare("DELETE FROM cancelled WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`); // B004
   db.prepare("DELETE FROM overrides WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`);  // B004
+  res.json({ ok: true });
+});
+
+// ── Categories ────────────────────────────────────────────────────────────────
+app.get("/api/categories", authMiddleware, (req, res) => {
+  const { type } = req.query;
+  if (type && !["income", "expense"].includes(type)) return res.status(400).json({ error: "type must be income or expense" });
+  const rows = type
+    ? db.prepare("SELECT * FROM categories WHERE user_id = ? AND type = ? ORDER BY name COLLATE NOCASE").all(req.user.id, type)
+    : db.prepare("SELECT * FROM categories WHERE user_id = ? ORDER BY type, name COLLATE NOCASE").all(req.user.id);
+  res.json(rows);
+});
+
+app.post("/api/categories", authMiddleware, (req, res) => {
+  const { name, type } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: "name is required" });
+  if (!["income", "expense"].includes(type)) return res.status(400).json({ error: "type must be income or expense" });
+  const trimmed = name.trim();
+  const dup = db.prepare("SELECT id FROM categories WHERE user_id = ? AND type = ? AND name = ? COLLATE NOCASE").get(req.user.id, type, trimmed);
+  if (dup) return res.status(400).json({ error: "A category with that name already exists" });
+  const result = db.prepare("INSERT INTO categories (user_id, name, type) VALUES (?, ?, ?)").run(req.user.id, trimmed, type);
+  res.json({ id: result.lastInsertRowid, name: trimmed, type });
+});
+
+app.put("/api/categories/:id", authMiddleware, (req, res) => {
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: "name is required" });
+  const trimmed = name.trim();
+  const existing = db.prepare("SELECT * FROM categories WHERE id = ? AND user_id = ?").get(req.params.id, req.user.id);
+  if (!existing) return res.status(404).json({ error: "Category not found" });
+  const dup = db.prepare("SELECT id FROM categories WHERE user_id = ? AND type = ? AND name = ? COLLATE NOCASE AND id != ?").get(req.user.id, existing.type, trimmed, req.params.id);
+  if (dup) return res.status(400).json({ error: "A category with that name already exists" });
+  db.prepare("UPDATE categories SET name = ? WHERE id = ? AND user_id = ?").run(trimmed, req.params.id, req.user.id);
+  res.json({ ok: true, id: Number(req.params.id), name: trimmed, type: existing.type });
+});
+
+app.delete("/api/categories/:id", authMiddleware, (req, res) => {
+  const existing = db.prepare("SELECT * FROM categories WHERE id = ? AND user_id = ?").get(req.params.id, req.user.id);
+  if (!existing) return res.status(404).json({ error: "Category not found" });
+  db.prepare("UPDATE items SET category_id = NULL WHERE category_id = ? AND user_id = ?").run(req.params.id, req.user.id);
+  db.prepare("DELETE FROM categories WHERE id = ? AND user_id = ?").run(req.params.id, req.user.id);
   res.json({ ok: true });
 });
 
@@ -287,6 +376,8 @@ app.post("/api/factory-reset", authMiddleware, (req, res) => {
   db.prepare("DELETE FROM cancelled WHERE user_id = ?").run(uid);
   db.prepare("DELETE FROM overrides WHERE user_id = ?").run(uid);
   db.prepare("DELETE FROM items WHERE user_id = ?").run(uid);
+  db.prepare("DELETE FROM categories WHERE user_id = ?").run(uid);
+  seedDefaultCategories(uid);
   db.prepare("UPDATE user_data SET starting_balance=3000, low_balance_threshold=500, forecast_days=60, dark_mode=1 WHERE user_id=?").run(uid);
   res.json({ ok: true });
 });
