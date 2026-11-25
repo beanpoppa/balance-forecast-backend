@@ -79,6 +79,14 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
 
+  CREATE TABLE IF NOT EXISTS moved (
+    user_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    new_date TEXT NOT NULL,
+    PRIMARY KEY (user_id, key),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
   CREATE TABLE IF NOT EXISTS cancelled (
     user_id INTEGER NOT NULL,
     key TEXT NOT NULL,
@@ -187,6 +195,7 @@ app.delete("/api/users/:id", authMiddleware, adminMiddleware, (req, res) => {
   db.prepare("DELETE FROM reconciled WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM cancelled WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM overrides WHERE user_id = ?").run(id); // B005
+  db.prepare("DELETE FROM moved WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM items WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM categories WHERE user_id = ?").run(id);
   db.prepare("DELETE FROM user_data WHERE user_id = ?").run(id);
@@ -260,7 +269,57 @@ app.delete("/api/items/:id", authMiddleware, (req, res) => {
   db.prepare("DELETE FROM reconciled WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`);
   db.prepare("DELETE FROM cancelled WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`); // B004
   db.prepare("DELETE FROM overrides WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`);  // B004
+  db.prepare("DELETE FROM moved WHERE user_id = ? AND key LIKE ?").run(req.user.id, `${req.params.id}_%`);
   res.json({ ok: true });
+});
+
+// Reschedule "this and all future" occurrences of a recurring item.
+// Body: { fromDate, newStartDate, amount?, dateMap: { oldDate: newDate } }
+// If fromDate is the item's first occurrence, the item is updated in place;
+// otherwise the series is split: the original ends the day before fromDate and
+// a copy starts on newStartDate. Per-occurrence data (reconciled, cancelled,
+// overrides, moved) at or after fromDate is re-keyed via dateMap (computed by
+// the client, which owns the recurrence logic); unmapped entries are dropped.
+const ANNOTATION_TABLES = ["reconciled", "cancelled", "overrides", "moved"];
+app.post("/api/items/:id/reschedule", authMiddleware, (req, res) => {
+  const { fromDate, newStartDate, amount, dateMap } = req.body;
+  const isDate = d => typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d);
+  if (!isDate(fromDate) || !isDate(newStartDate)) return res.status(400).json({ error: "fromDate and newStartDate (YYYY-MM-DD) are required" });
+  const map = dateMap && typeof dateMap === "object" ? dateMap : {};
+  const item = db.prepare("SELECT * FROM items WHERE id = ? AND user_id = ?").get(req.params.id, req.user.id);
+  if (!item) return res.status(404).json({ error: "Item not found" });
+  if (item.frequency === "One-time") return res.status(400).json({ error: "Item is not recurring" });
+  if (item.end_date && newStartDate > item.end_date) return res.status(400).json({ error: "New date is after the item's end date" });
+  const newAmount = amount !== undefined && amount !== null && !isNaN(Number(amount)) ? Number(amount) : item.amount;
+
+  const result = db.transaction(() => {
+    let targetId = item.id;
+    if (fromDate <= item.start_date) {
+      db.prepare("UPDATE items SET start_date = ?, amount = ? WHERE id = ? AND user_id = ?").run(newStartDate, newAmount, item.id, req.user.id);
+    } else {
+      const d = new Date(fromDate + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() - 1);
+      db.prepare("UPDATE items SET end_date = ? WHERE id = ? AND user_id = ?").run(d.toISOString().slice(0, 10), item.id, req.user.id);
+      targetId = db.prepare("INSERT INTO items (user_id, name, amount, type, frequency, start_date, end_date, category_id) VALUES (?,?,?,?,?,?,?,?)")
+        .run(req.user.id, item.name, newAmount, item.type, item.frequency, newStartDate, item.end_date || "", item.category_id).lastInsertRowid;
+    }
+    const prefix = `${item.id}_`;
+    for (const table of ANNOTATION_TABLES) {
+      const rows = db.prepare(`SELECT * FROM ${table} WHERE user_id = ? AND key LIKE ?`).all(req.user.id, `${prefix}%`)
+        .filter(r => r.key.slice(prefix.length) >= fromDate);
+      const del = db.prepare(`DELETE FROM ${table} WHERE user_id = ? AND key = ?`);
+      rows.forEach(r => del.run(req.user.id, r.key));
+      rows.forEach(r => {
+        const mapped = map[r.key.slice(prefix.length)];
+        if (!isDate(mapped)) return;
+        const newKey = `${targetId}_${mapped}`;
+        if (table === "overrides") db.prepare("INSERT OR REPLACE INTO overrides (user_id, key, amount) VALUES (?, ?, ?)").run(req.user.id, newKey, r.amount);
+        else if (table === "moved") db.prepare("INSERT OR REPLACE INTO moved (user_id, key, new_date) VALUES (?, ?, ?)").run(req.user.id, newKey, r.new_date);
+        else db.prepare(`INSERT OR REPLACE INTO ${table} (user_id, key) VALUES (?, ?)`).run(req.user.id, newKey);
+      });
+    }
+    return targetId;
+  })();
+  res.json({ ok: true, id: Number(result), split: Number(result) !== item.id });
 });
 
 // ── Categories ────────────────────────────────────────────────────────────────
@@ -369,12 +428,35 @@ app.delete("/api/overrides/:key", authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
+// ── Moved (single-occurrence date changes) ───────────────────────────────────
+// key is the occurrence's original key (`${itemId}_${originalDate}`)
+app.get("/api/moved", authMiddleware, (req, res) => {
+  const rows = db.prepare("SELECT key, new_date FROM moved WHERE user_id = ?").all(req.user.id);
+  const obj = {};
+  rows.forEach(r => obj[r.key] = r.new_date);
+  res.json(obj);
+});
+
+app.post("/api/moved", authMiddleware, (req, res) => {
+  const { key, newDate } = req.body;
+  if (!key || !/^\d+_\d{4}-\d{2}-\d{2}$/.test(key) || !/^\d{4}-\d{2}-\d{2}$/.test(newDate || ""))
+    return res.status(400).json({ error: "key and newDate (YYYY-MM-DD) required" });
+  db.prepare("INSERT OR REPLACE INTO moved (user_id, key, new_date) VALUES (?, ?, ?)").run(req.user.id, key, newDate);
+  res.json({ ok: true, key, newDate });
+});
+
+app.delete("/api/moved/:key", authMiddleware, (req, res) => {
+  db.prepare("DELETE FROM moved WHERE user_id = ? AND key = ?").run(req.user.id, decodeURIComponent(req.params.key));
+  res.json({ ok: true });
+});
+
 // ── Factory reset ─────────────────────────────────────────────────────────────
 app.post("/api/factory-reset", authMiddleware, (req, res) => {
   const uid = req.user.id;
   db.prepare("DELETE FROM reconciled WHERE user_id = ?").run(uid);
   db.prepare("DELETE FROM cancelled WHERE user_id = ?").run(uid);
   db.prepare("DELETE FROM overrides WHERE user_id = ?").run(uid);
+  db.prepare("DELETE FROM moved WHERE user_id = ?").run(uid);
   db.prepare("DELETE FROM items WHERE user_id = ?").run(uid);
   db.prepare("DELETE FROM categories WHERE user_id = ?").run(uid);
   seedDefaultCategories(uid);
